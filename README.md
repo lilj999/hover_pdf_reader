@@ -1,5 +1,3 @@
-# Choose Your Language / 选择语言
-
 [English (README.md)](README.md) | [中文 (README_zh.md)](README_zh.md)
 
 # 📄 Simple Professional PDF Reader
