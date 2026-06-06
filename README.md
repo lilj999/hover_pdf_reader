@@ -25,8 +25,8 @@
 
 ### 安装
 ```bash
-git clone https://github.com/lilj999/simple_pdf_reader.git
-cd simple_pdf_reader
+git clone https://github.com/lilj999/hover_pdf_reader.git
+cd hover_pdf_reader
 
 ```bash
 python -m venv .venv
