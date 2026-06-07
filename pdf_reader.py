@@ -2,7 +2,7 @@
 """
 Simple Professional PDF Reader
 
-版本：v7 - 支持 Nature/Springer 上标范围引用批量预览。
+版本：v9 - 科研阅读增强版：导航、搜索、高亮、书签、笔记、阅读进度恢复。
 
 功能：
 - 打开 PDF
@@ -14,6 +14,9 @@ Simple Professional PDF Reader
 - 返回上一次跳转位置
 - 页面图片对象悬浮放大预览
 - 大尺寸悬浮预览 / 右侧预览栏
+- 左侧目录/页码/搜索/书签/笔记面板
+- 全文搜索与命中高亮
+- 每篇论文阅读进度、缩放、书签和笔记自动保存
 
 依赖：
     pip install PySide6 PyMuPDF
@@ -33,12 +36,14 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QSize, QTimer
-from PySide6.QtGui import QAction, QCursor, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QBrush, QCursor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFrame,
+    QInputDialog,
     QMenu,
+    QMenuBar,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -46,15 +51,21 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QListWidget,
+    QListWidgetItem,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 
 
 @dataclass
@@ -139,7 +150,8 @@ class PreviewPopup(QFrame):
         self._move_near_cursor(global_pos)
         self.show()
 
-    def show_image(self, title: str, pixmap: QPixmap, global_pos: QPoint, max_size: QSize = QSize(720, 520)) -> None:
+    # 将默认最大尺寸提升，以便在弹出预览时显示更大的图片
+    def show_image(self, title: str, pixmap: QPixmap, global_pos: QPoint, max_size: QSize = QSize(960, 720)) -> None:
         self._title.setText(title)
         if pixmap.width() > max_size.width() or pixmap.height() > max_size.height():
             pixmap = pixmap.scaled(max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -170,9 +182,12 @@ class PreviewPanel(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("PreviewPanel")
-        self.setMinimumWidth(340)
-        self.setMaximumWidth(520)
+        # 允许预览栏完全收起，最小宽度设为 0，最大宽度保持 520
+        self.setMinimumWidth(0)
+        # 扩大预览栏最大宽度，便于显示更宽内容
+        self.setMaximumWidth(800)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setStyleSheet(
             """
             QFrame#PreviewPanel {
@@ -250,8 +265,9 @@ class PreviewPanel(QFrame):
     def show_image(self, title: str, pixmap: QPixmap) -> None:
         self._title.setText(title)
         self._hint.setText("单击链接可跳转；按 Alt+← 或工具栏“返回”可回到原阅读位置。")
-        max_w = max(260, self.width() - 34)
-        max_h = max(440, self.height() - 90)
+        # 根据预览栏实际宽度动态计算更大的显示尺寸，确保图片清晰可见
+        max_w = max(400, self.width() - 20)
+        max_h = max(600, self.height() - 60)
         if pixmap.width() > max_w or pixmap.height() > max_h:
             pixmap = pixmap.scaled(QSize(max_w, max_h), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._image.setPixmap(pixmap)
@@ -260,6 +276,7 @@ class PreviewPanel(QFrame):
         self._image.show()
         self._text.clear()
         self._text.hide()
+        self.setFocus(Qt.OtherFocusReason)
 
     def clear_preview(self) -> None:
         self._title.setText("预览")
@@ -268,6 +285,15 @@ class PreviewPanel(QFrame):
         self._image.hide()
         self._text.clear()
         self._text.hide()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+            if self._image.isVisible() and self._image.pixmap() and not self._image.pixmap().isNull():
+                QApplication.clipboard().setPixmap(self._image.pixmap())
+                self._hint.setText("图片已复制到剪贴板")
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 class PageView(QLabel):
@@ -298,6 +324,8 @@ class PageView(QLabel):
         self._selection_rect: Optional[QRect] = None
         self._selecting = False
         self._pressed_link: Optional[LinkRegion] = None
+        self.search_highlights: List[fitz.Rect] = []
+        self.current_search_rect: Optional[fitz.Rect] = None
 
     def set_page_content(
         self,
@@ -408,7 +436,17 @@ class PageView(QLabel):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
+        if self.search_highlights:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(255, 230, 0, 82)))
+            for rect in self.search_highlights:
+                painter.drawRect(self._page_rect_to_widget_rect(rect))
+            if self.current_search_rect is not None:
+                painter.setBrush(QBrush(QColor(255, 128, 0, 96)))
+                painter.drawRect(self._page_rect_to_widget_rect(self.current_search_rect))
+
         if self._selection_rect and not self._selection_rect.isEmpty():
+            painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(Qt.black, 1, Qt.DashLine))
             painter.drawRect(self._selection_rect)
 
@@ -459,6 +497,17 @@ class PageView(QLabel):
         text = self._get_selected_text()
         if text:
             self.main_window.show_preview_text("选中文本预览", text)
+
+
+    def set_search_highlights(self, rects: List[fitz.Rect], current_rect: Optional[fitz.Rect] = None) -> None:
+        self.search_highlights = rects
+        self.current_search_rect = current_rect
+        self.update()
+
+    def clear_search_highlights(self) -> None:
+        self.search_highlights = []
+        self.current_search_rect = None
+        self.update()
 
     def _widget_to_page_point(self, pos: QPoint) -> fitz.Point:
         return fitz.Point(pos.x() / self.render_scale, pos.y() / self.render_scale)
@@ -655,6 +704,15 @@ class PdfReaderWindow(QMainWindow):
         self.references: dict = {}
         self.config_file = Path.home() / ".pdf_reader_config.json"
         self.last_file_dir = self._load_last_dir()
+        self.state_file = Path.home() / ".pdf_reader_research_state.json"
+        self.app_state = self._load_app_state()
+        self.bookmarks: List[dict] = []
+        self.notes: dict = {}
+        self.note_editor_page: Optional[int] = None
+        self.search_hits: List[Tuple[int, fitz.Rect, str]] = []
+        self.search_index = -1
+        self._pending_restore_scroll: Optional[int] = None
+
 
         self.scroll_content = QWidget()
         self.scroll_content.setObjectName("ScrollContent")
@@ -674,18 +732,420 @@ class PdfReaderWindow(QMainWindow):
         self.preview_panel = PreviewPanel()
         self.preview_panel.setVisible(True)
 
+        self.nav_tabs = self._build_sidebar()
+
         self.splitter = QSplitter(Qt.Horizontal)
-        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setChildrenCollapsible(True)  # 允许预览区可拖动隐藏/显示
         self.splitter.addWidget(self.scroll_area)
         self.splitter.addWidget(self.preview_panel)
         self.splitter.setSizes([900, 360])
-        self.setCentralWidget(self.splitter)
+        # 设置拖动手柄使其可见
+        self.splitter.setHandleWidth(8)
+
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(True)  # 允许列表区可拖动隐藏/显示
+        self.main_splitter.addWidget(self.nav_tabs)
+        self.main_splitter.addWidget(self.splitter)
+        self.main_splitter.setSizes([260, 1000])
+        # 设置拖动手柄使其可见
+        self.main_splitter.setHandleWidth(8)
+        self.setCentralWidget(self.main_splitter)
         self.setAcceptDrops(True)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self._build_menu()
         self._build_toolbar()
         self._apply_style()
+
+
+    def _build_sidebar(self) -> QTabWidget:
+        tabs = QTabWidget()
+        tabs.setObjectName("NavTabs")
+        tabs.setMinimumWidth(230)
+        tabs.setMaximumWidth(360)
+
+        self.outline_tree = QTreeWidget()
+        self.outline_tree.setHeaderLabels(["目录", "页"])
+        self.outline_tree.itemClicked.connect(self.on_outline_clicked)
+        tabs.addTab(self.outline_tree, "目录")
+
+        self.pages_list = QListWidget()
+        self.pages_list.itemClicked.connect(self.on_page_item_clicked)
+        tabs.addTab(self.pages_list, "页码")
+
+        self.search_results_list = QListWidget()
+        self.search_results_list.itemClicked.connect(self.on_search_result_clicked)
+        tabs.addTab(self.search_results_list, "搜索")
+
+        bookmarks_page = QWidget()
+        bookmarks_layout = QVBoxLayout(bookmarks_page)
+        bookmarks_layout.setContentsMargins(6, 6, 6, 6)
+        self.bookmark_list = QListWidget()
+        self.bookmark_list.itemClicked.connect(self.on_bookmark_clicked)
+        add_btn = QPushButton("添加当前页书签")
+        add_btn.clicked.connect(self.add_bookmark_current)
+        del_btn = QPushButton("删除选中书签")
+        del_btn.clicked.connect(self.delete_selected_bookmark)
+        bookmarks_layout.addWidget(self.bookmark_list, 1)
+        bookmarks_layout.addWidget(add_btn)
+        bookmarks_layout.addWidget(del_btn)
+        tabs.addTab(bookmarks_page, "书签")
+
+        notes_page = QWidget()
+        notes_layout = QVBoxLayout(notes_page)
+        notes_layout.setContentsMargins(6, 6, 6, 6)
+        self.note_title = QLabel("当前页笔记")
+        self.note_title.setWordWrap(True)
+        self.note_editor = QPlainTextEdit()
+        self.note_editor.setPlaceholderText("在这里记录当前页想法、问题、实验结论等。")
+        save_note_btn = QPushButton("保存当前页笔记")
+        save_note_btn.clicked.connect(self.save_current_note)
+        self.notes_list = QListWidget()
+        self.notes_list.itemClicked.connect(self.on_note_item_clicked)
+        notes_layout.addWidget(self.note_title)
+        notes_layout.addWidget(self.note_editor, 1)
+        notes_layout.addWidget(save_note_btn)
+        notes_layout.addWidget(QLabel("已有笔记"))
+        notes_layout.addWidget(self.notes_list, 1)
+        tabs.addTab(notes_page, "笔记")
+        return tabs
+
+    def populate_navigation_panels(self) -> None:
+        self.populate_outline()
+        self.populate_pages_list()
+        self.populate_bookmarks_list()
+        self.populate_notes_list()
+        self.update_note_editor_for_page(self.current_page)
+
+    def populate_outline(self) -> None:
+        self.outline_tree.clear()
+        if not self.doc:
+            return
+        toc = []
+        try:
+            toc = self.doc.get_toc(simple=True)
+        except Exception:
+            toc = []
+        if toc:
+            level_items = {}
+            for level, title, page_no in toc:
+                item = QTreeWidgetItem([str(title), str(page_no)])
+                item.setData(0, Qt.UserRole, max(0, int(page_no) - 1))
+                parent = level_items.get(level - 1)
+                if parent is not None:
+                    parent.addChild(item)
+                else:
+                    self.outline_tree.addTopLevelItem(item)
+                level_items[level] = item
+            self.outline_tree.expandToDepth(1)
+            return
+        # 没有 PDF 内置目录时，按常见论文章节标题自动生成简易目录。
+        heading_patterns = [
+            r"^abstract\b", r"^\d+(?:\.\d+)*\s+\S+", r"^i+\.\s+\S+",
+            r"^introduction\b", r"^related\s+work\b", r"^method\b", r"^methods\b",
+            r"^experiments?\b", r"^evaluation\b", r"^results?\b", r"^discussion\b",
+            r"^conclusion\b", r"^references\b", r"^appendix\b",
+        ]
+        added = set()
+        for page_index in range(self.doc.page_count):
+            try:
+                blocks = self.doc.load_page(page_index).get_text("blocks")
+            except Exception:
+                continue
+            for block in blocks:
+                if len(block) < 5:
+                    continue
+                line = re.sub(r"\s+", " ", str(block[4]).strip()).strip()
+                if not line or len(line) > 90:
+                    continue
+                lower = line.lower()
+                if any(re.match(p, lower) for p in heading_patterns):
+                    key = (page_index, lower)
+                    if key in added:
+                        continue
+                    added.add(key)
+                    item = QTreeWidgetItem([line, str(page_index + 1)])
+                    item.setData(0, Qt.UserRole, page_index)
+                    self.outline_tree.addTopLevelItem(item)
+                    break
+
+    def populate_pages_list(self) -> None:
+        self.pages_list.clear()
+        if not self.doc:
+            return
+        for i in range(self.doc.page_count):
+            item = QListWidgetItem(f"第 {i + 1} 页")
+            item.setData(Qt.UserRole, i)
+            self.pages_list.addItem(item)
+
+    def populate_bookmarks_list(self) -> None:
+        self.bookmark_list.clear()
+        for bm in self.bookmarks:
+            page = int(bm.get("page", 0))
+            title = bm.get("title") or f"第 {page + 1} 页"
+            item = QListWidgetItem(f"{page + 1}: {title}")
+            item.setData(Qt.UserRole, page)
+            self.bookmark_list.addItem(item)
+
+    def populate_notes_list(self) -> None:
+        self.notes_list.clear()
+        for key in sorted(self.notes, key=lambda x: int(x) if str(x).isdigit() else 10**9):
+            text = str(self.notes.get(key, "")).strip()
+            if not text:
+                continue
+            page = int(key)
+            first = re.sub(r"\s+", " ", text).strip()[:48]
+            item = QListWidgetItem(f"{page + 1}: {first}")
+            item.setData(Qt.UserRole, page)
+            self.notes_list.addItem(item)
+
+    def on_outline_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        page = item.data(0, Qt.UserRole)
+        if page is not None:
+            self.scroll_to_page(int(page))
+
+    def on_page_item_clicked(self, item: QListWidgetItem) -> None:
+        page = item.data(Qt.UserRole)
+        if page is not None:
+            self.scroll_to_page(int(page))
+
+    def on_bookmark_clicked(self, item: QListWidgetItem) -> None:
+        page = item.data(Qt.UserRole)
+        if page is not None:
+            self.scroll_to_page(int(page))
+
+    def on_note_item_clicked(self, item: QListWidgetItem) -> None:
+        page = item.data(Qt.UserRole)
+        if page is not None:
+            self.scroll_to_page(int(page))
+            self.nav_tabs.setCurrentWidget(self.note_editor.parentWidget())
+
+    def add_bookmark_current(self) -> None:
+        if not self.doc:
+            return
+        default_title = f"第 {self.current_page + 1} 页"
+        title, ok = QInputDialog.getText(self, "添加书签", "书签名称：", text=default_title)
+        if not ok:
+            return
+        title = title.strip() or default_title
+        page = int(self.current_page)
+        self.bookmarks = [bm for bm in self.bookmarks if int(bm.get("page", -1)) != page]
+        self.bookmarks.append({"page": page, "title": title})
+        self.bookmarks.sort(key=lambda bm: int(bm.get("page", 0)))
+        self.populate_bookmarks_list()
+        self._save_current_document_state()
+        self.status.showMessage(f"已添加书签：{title}", 2000)
+
+    def delete_selected_bookmark(self) -> None:
+        item = self.bookmark_list.currentItem()
+        if not item:
+            return
+        page = int(item.data(Qt.UserRole))
+        self.bookmarks = [bm for bm in self.bookmarks if int(bm.get("page", -1)) != page]
+        self.populate_bookmarks_list()
+        self._save_current_document_state()
+        self.status.showMessage("已删除书签", 2000)
+
+    def update_note_editor_for_page(self, page_index: int) -> None:
+        if not hasattr(self, "note_editor"):
+            return
+        self.note_editor_page = page_index
+        self.note_title.setText(f"第 {page_index + 1} 页笔记")
+        self.note_editor.blockSignals(True)
+        self.note_editor.setPlainText(str(self.notes.get(str(page_index), "")))
+        self.note_editor.blockSignals(False)
+
+    def save_current_note(self) -> None:
+        if self.note_editor_page is None:
+            return
+        text = self.note_editor.toPlainText().strip()
+        key = str(self.note_editor_page)
+        if text:
+            self.notes[key] = text
+        else:
+            self.notes.pop(key, None)
+        self.populate_notes_list()
+        self._save_current_document_state()
+        self.status.showMessage("笔记已保存", 2000)
+
+    def search_document(self) -> None:
+        if not self.doc:
+            return
+        query = self.search_edit.text().strip()
+        self.search_results_list.clear()
+        self.search_hits = []
+        self.search_index = -1
+        for view in self.page_views:
+            view.clear_search_highlights()
+        if not query:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for page_index in range(self.doc.page_count):
+                page = self.doc.load_page(page_index)
+                rects = page.search_for(query)
+                for rect in rects:
+                    clip = fitz.Rect(max(0, rect.x0 - 80), max(0, rect.y0 - 22), min(page.rect.width, rect.x1 + 220), min(page.rect.height, rect.y1 + 22))
+                    excerpt = re.sub(r"\s+", " ", page.get_textbox(clip)).strip()
+                    if not excerpt:
+                        excerpt = query
+                    self.search_hits.append((page_index, rect, excerpt[:180]))
+        except Exception as exc:
+            QMessageBox.warning(self, "搜索失败", f"全文搜索失败：\n{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._refresh_search_results()
+        self._apply_search_highlights()
+        if self.search_hits:
+            self.search_index = 0
+            self.goto_search_hit(0)
+        self.status.showMessage(f"搜索“{query}”：{len(self.search_hits)} 处命中", 3000)
+
+    def _refresh_search_results(self) -> None:
+        self.search_results_list.clear()
+        for idx, (page, rect, excerpt) in enumerate(self.search_hits):
+            item = QListWidgetItem(f"第 {page + 1} 页：{excerpt}")
+            item.setData(Qt.UserRole, idx)
+            self.search_results_list.addItem(item)
+        if self.search_hits:
+            # 自动显示左列表区并切换到搜索结果标签页
+            if not self.nav_tabs.isVisible():
+                self.nav_tabs.setVisible(True)
+                self.sidebar_action.setChecked(True)
+            self.nav_tabs.setCurrentWidget(self.search_results_list)
+
+    def _apply_search_highlights(self) -> None:
+        by_page = {}
+        current = self.search_hits[self.search_index] if 0 <= self.search_index < len(self.search_hits) else None
+        for page, rect, _ in self.search_hits:
+            by_page.setdefault(page, []).append(rect)
+        for view in self.page_views:
+            cur_rect = current[1] if current and current[0] == view.page_index else None
+            view.set_search_highlights(by_page.get(view.page_index, []), cur_rect)
+
+    def goto_search_hit(self, index: int) -> None:
+        if not self.search_hits:
+            return
+        self.search_index = max(0, min(index, len(self.search_hits) - 1))
+        page, rect, _ = self.search_hits[self.search_index]
+        self._apply_search_highlights()
+        self.search_results_list.setCurrentRow(self.search_index)
+        self.scroll_to_page(page, rect.y0)
+
+    def search_next_hit(self) -> None:
+        if not self.search_hits:
+            self.search_document()
+            return
+        self.goto_search_hit((self.search_index + 1) % len(self.search_hits))
+
+    def search_prev_hit(self) -> None:
+        if not self.search_hits:
+            self.search_document()
+            return
+        self.goto_search_hit((self.search_index - 1) % len(self.search_hits))
+
+    def on_search_result_clicked(self, item: QListWidgetItem) -> None:
+        idx = item.data(Qt.UserRole)
+        if idx is not None:
+            self.goto_search_hit(int(idx))
+
+    def _build_menu(self) -> None:
+        menubar = self.menuBar()
+        
+        # File 菜单
+        file_menu = menubar.addMenu("文件(&F)")
+        
+        open_action = QAction("打开(&O)", self)
+        open_action.setShortcut(QKeySequence.Open)
+        open_action.triggered.connect(self.open_file_dialog)
+        file_menu.addAction(open_action)
+        
+        file_menu.addSeparator()
+        
+        print_action = QAction("打印(&P)", self)
+        print_action.setShortcut(QKeySequence.Print)
+        print_action.triggered.connect(self.print_pdf)
+        file_menu.addAction(print_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("退出(&X)", self)
+        exit_action.setShortcut(QKeySequence.Quit)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # View 菜单
+        view_menu = menubar.addMenu("查看(&V)")
+        
+        self.sidebar_action = QAction("左列表区(&L)", self)
+        self.sidebar_action.setCheckable(True)
+        self.sidebar_action.setChecked(True)
+        self.sidebar_action.triggered.connect(self.toggle_sidebar)
+        view_menu.addAction(self.sidebar_action)
+        
+        self.preview_panel_action = QAction("预览栏(&P)", self)
+        self.preview_panel_action.setCheckable(True)
+        self.preview_panel_action.setChecked(True)
+        self.preview_panel_action.triggered.connect(self.toggle_preview_panel)
+        view_menu.addAction(self.preview_panel_action)
+
+    def toggle_sidebar(self) -> None:
+        visible = self.sidebar_action.isChecked()
+        self.nav_tabs.setVisible(visible)
+        if visible:
+            self.status.showMessage("左列表区已显示", 2000)
+        else:
+            self.status.showMessage("左列表区已隐藏", 2000)
+
+    def print_pdf(self) -> None:
+        if not self.doc or not self.file_path:
+            QMessageBox.warning(self, "无法打印", "没有打开任何 PDF 文件。")
+            return
+        
+        try:
+            import subprocess
+            import platform
+            
+            # 使用系统默认 PDF 阅读器的打印功能
+            if platform.system() == 'Windows':
+                # Windows: 使用 ShellExecute 打开打印对话框
+                import ctypes
+                from ctypes import wintypes
+                
+                OpenAsInfo = ctypes.Structure
+                OpenAsInfo._fields_ = [
+                    ('cbSize', wintypes.DWORD),
+                    ('lpClass', wintypes.LPCWSTR),
+                    ('lpAction', wintypes.LPCWSTR),
+                    ('pcszFile', wintypes.LPCWSTR),
+                    ('pcszClass', wintypes.LPCWSTR),
+                ]
+                
+                try:
+                    shell32 = ctypes.windll.shell32
+                    oainfo = OpenAsInfo()
+                    oainfo.cbSize = ctypes.sizeof(OpenAsInfo)
+                    oainfo.lpAction = "print"
+                    oainfo.pcszFile = self.file_path
+                    shell32.OpenAsInfoW(ctypes.byref(oainfo), None, 0)
+                except Exception:
+                    # 备选方案：使用 AcroExch.PDFFile COM 对象或系统关联打印
+                    subprocess.Popen(['explorer.exe', '/print,', self.file_path])
+            elif platform.system() == 'Darwin':
+                # macOS
+                subprocess.Popen(['open', '-a', 'Preview', self.file_path])
+            else:
+                # Linux
+                subprocess.Popen(['xdg-open', self.file_path])
+            
+            self.status.showMessage("打印对话框已打开", 2000)
+        except Exception as exc:
+            QMessageBox.warning(self, "打印失败", f"打印过程中出错：\n{exc}")
+
+    def _print_to_printer(self, printer: QPrinter) -> None:
+        # 这个方法已弃用，使用简化的打印方案
+        pass
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("主工具栏")
@@ -749,11 +1209,28 @@ class PdfReaderWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self.preview_panel_action = QAction("预览栏", self)
-        self.preview_panel_action.setCheckable(True)
-        self.preview_panel_action.setChecked(True)
-        self.preview_panel_action.triggered.connect(self.toggle_preview_panel)
-        toolbar.addAction(self.preview_panel_action)
+        bookmark_action = QAction("加书签", self)
+        bookmark_action.setShortcut(QKeySequence("Ctrl+B"))
+        bookmark_action.triggered.connect(self.add_bookmark_current)
+        toolbar.addAction(bookmark_action)
+
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel("搜索"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("关键词 ↵")
+        self.search_edit.setFixedWidth(170)
+        self.search_edit.returnPressed.connect(self.search_document)
+        toolbar.addWidget(self.search_edit)
+
+        search_prev = QAction("上一个", self)
+        search_prev.setShortcut(QKeySequence("Shift+F3"))
+        search_prev.triggered.connect(self.search_prev_hit)
+        toolbar.addAction(search_prev)
+
+        search_next = QAction("下一个", self)
+        search_next.setShortcut(QKeySequence("F3"))
+        search_next.triggered.connect(self.search_next_hit)
+        toolbar.addAction(search_next)
 
         toolbar.addSeparator()
         toolbar.addWidget(QLabel("查页"))
@@ -824,6 +1301,19 @@ class PdfReaderWindow(QMainWindow):
             }
             QStatusBar { background: #f8fafc; color: #4b5563; border-top: 1px solid #d3d8e0; }
             QSplitter::handle { background: #c9ced6; width: 1px; }
+            QTabWidget#NavTabs::pane { border-right: 1px solid #c9ced6; background: #f8fafc; }
+            QTreeWidget, QListWidget, QPlainTextEdit {
+                background: #ffffff;
+                border: 1px solid #d3d8e0;
+                border-radius: 4px;
+            }
+            QPushButton {
+                background: #ffffff;
+                border: 1px solid #aeb6c2;
+                border-radius: 4px;
+                padding: 5px 8px;
+            }
+            QPushButton:hover { background: #f3f4f6; }
             """
         )
 
@@ -845,23 +1335,37 @@ class PdfReaderWindow(QMainWindow):
             return
 
         if self.doc:
+            self._save_current_document_state()
             self.doc.close()
         self.doc = doc
-        self.file_path = path
+        self.file_path = os.path.abspath(path)
         self.last_file_dir = os.path.dirname(path)
         self._save_last_dir()
-        self.current_page = 0
+        doc_state = self._get_document_state(self.file_path)
+        self.current_page = max(0, min(int(doc_state.get("last_page", 0)), doc.page_count - 1))
+        self.zoom = float(doc_state.get("zoom", self.zoom))
+        self._pending_restore_scroll = doc_state.get("scroll")
+        self.bookmarks = list(doc_state.get("bookmarks", []))
+        self.notes = dict(doc_state.get("notes", {}))
         self.history.clear()
         self.references.clear()
+        self.search_hits = []
+        self.search_index = -1
+        if hasattr(self, "search_results_list"):
+            self.search_results_list.clear()
         self.back_action.setEnabled(False)
         self.page_spin.blockSignals(True)
         self.page_spin.setMaximum(doc.page_count)
-        self.page_spin.setValue(1)
+        self.page_spin.setValue(self.current_page + 1)
         self.page_spin.blockSignals(False)
         self.page_count_label.setText(f"/ {doc.page_count}")
         self.setWindowTitle(f"PDF Reader - {os.path.basename(path)}")
         self._build_references_cache()
+        self.populate_navigation_panels()
+        self._remember_recent_file(self.file_path)
         self.render_all_pages()
+        if self._pending_restore_scroll is not None:
+            QTimer.singleShot(120, self._restore_scroll_after_render)
         self.status.showMessage(f"已打开：{path}")
 
     def render_all_pages(self) -> None:
@@ -1799,6 +2303,7 @@ class PdfReaderWindow(QMainWindow):
         self.current_page = page_index
         self._sync_page_spin(page_index)
         self._update_status_current_page()
+        self.update_note_editor_for_page(page_index)
 
     def on_scroll_changed(self, value: int) -> None:
         if self._syncing_scroll or not self.doc or not self.page_frames:
@@ -1818,6 +2323,7 @@ class PdfReaderWindow(QMainWindow):
             self.current_page = current
             self._sync_page_spin(current)
             self._update_status_current_page()
+            self.update_note_editor_for_page(current)
 
     def _sync_page_spin(self, page_index: int) -> None:
         self._syncing_page_spin = True
@@ -1838,6 +2344,9 @@ class PdfReaderWindow(QMainWindow):
         self.preview_panel.setVisible(visible)
         if visible:
             self.preview_panel.clear_preview()
+            self.status.showMessage("预览栏已显示", 2000)
+        else:
+            self.status.showMessage("预览栏已隐藏", 2000)
 
     def is_preview_panel_visible(self) -> bool:
         return self.preview_panel.isVisible()
@@ -1874,6 +2383,74 @@ class PdfReaderWindow(QMainWindow):
                     return
         event.ignore()
 
+
+    def _document_key(self, path: Optional[str] = None) -> str:
+        return os.path.abspath(path or self.file_path or "")
+
+    def _load_app_state(self) -> dict:
+        try:
+            if self.state_file.exists():
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        data.setdefault("documents", {})
+                        data.setdefault("recent_files", [])
+                        return data
+        except Exception:
+            pass
+        return {"documents": {}, "recent_files": []}
+
+    def _save_app_state(self) -> None:
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(self.app_state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _get_document_state(self, path: str) -> dict:
+        key = self._document_key(path)
+        docs = self.app_state.setdefault("documents", {})
+        state = docs.get(key, {})
+        return state if isinstance(state, dict) else {}
+
+    def _save_current_document_state(self) -> None:
+        if not self.file_path or not self.doc:
+            return
+        if hasattr(self, "note_editor") and self.note_editor_page is not None:
+            # 自动保存当前页笔记草稿。
+            text = self.note_editor.toPlainText().strip()
+            key = str(self.note_editor_page)
+            if text:
+                self.notes[key] = text
+            else:
+                self.notes.pop(key, None)
+        docs = self.app_state.setdefault("documents", {})
+        docs[self._document_key()] = {
+            "last_page": int(self.current_page),
+            "scroll": int(self.scroll_area.verticalScrollBar().value()) if hasattr(self, "scroll_area") else 0,
+            "zoom": float(self.zoom),
+            "bookmarks": self.bookmarks,
+            "notes": self.notes,
+        }
+        self._save_app_state()
+
+    def _remember_recent_file(self, path: str) -> None:
+        path = self._document_key(path)
+        recent = [p for p in self.app_state.get("recent_files", []) if p != path and os.path.exists(p)]
+        recent.insert(0, path)
+        self.app_state["recent_files"] = recent[:20]
+        self._save_app_state()
+
+    def _restore_scroll_after_render(self) -> None:
+        if self._pending_restore_scroll is None:
+            return
+        try:
+            self.scroll_area.verticalScrollBar().setValue(int(self._pending_restore_scroll))
+        except Exception:
+            pass
+        self._pending_restore_scroll = None
+
     def _load_last_dir(self) -> str:
         try:
             if self.config_file.exists():
@@ -1895,6 +2472,7 @@ class PdfReaderWindow(QMainWindow):
             pass
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._save_current_document_state()
         self._save_last_dir()
         for view in self.page_views:
             view.preview.hide()
