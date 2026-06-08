@@ -326,6 +326,8 @@ class PageView(QLabel):
         self._pressed_link: Optional[LinkRegion] = None
         self.search_highlights: List[fitz.Rect] = []
         self.current_search_rect: Optional[fitz.Rect] = None
+        # 用户自定义高亮列表，元素为 (fitz.Rect, QColor)
+        self.user_highlights: List[Tuple[fitz.Rect, QColor]] = []
 
     def set_page_content(
         self,
@@ -396,11 +398,34 @@ class PageView(QLabel):
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
+            # 鼠标左键点击时的行为分两种：
+            # 1. 如果点击在图片区域，则保持原有的框选逻辑，允许用户拖拽选择图片或文字块。
+            # 2. 否则尝试在点击位置选取单个单词，类似 Adobe Reader 的“单词选取”。
             self.setFocus(Qt.MouseFocusReason)
-            self._selection_origin = event.position().toPoint()
+            click_pos = event.position().toPoint()
+            page_point = self._widget_to_page_point(click_pos)
+            # 首先检查是否点中了图片，若是则进入矩形选取模式。
+            if self._hit_image(page_point):
+                self._selection_origin = click_pos
+                self._selection_rect = QRect(self._selection_origin, self._selection_origin)
+                self._selecting = True
+                self._pressed_link = self._hit_link(page_point)
+                return
+            # 非图片区域：尝试选取光标所在的单词。
+            word_rect = self._find_word_rect(page_point)
+            if word_rect:
+                # 将 PDF 坐标转换为 widget 坐标后直接设为选区。
+                self._selection_rect = self._page_rect_to_widget_rect(word_rect).toRect()
+                self._selecting = False
+                self._pressed_link = None
+                # 立即更新复制预览（如果预览面板可见）。
+                self._update_selection_preview()
+                self.update()
+                return
+            # 若未找到单词，则回退到原有的空选区行为，保持后续的拖拽可创建矩形选区。
+            self._selection_origin = click_pos
             self._selection_rect = QRect(self._selection_origin, self._selection_origin)
             self._selecting = True
-            page_point = self._widget_to_page_point(self._selection_origin)
             self._pressed_link = self._hit_link(page_point)
             return
         super().mousePressEvent(event)
@@ -425,10 +450,26 @@ class PageView(QLabel):
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         menu = QMenu(self)
+        # 复制文本
         copy_action = QAction("复制文本", self)
         copy_action.triggered.connect(self._copy_selection_text)
         copy_action.setEnabled(bool(self._selection_rect and not self._selection_rect.isEmpty()))
         menu.addAction(copy_action)
+        # 高亮颜色子菜单（仅在有选区时显示）
+        if self._selection_rect and not self._selection_rect.isEmpty():
+            color_menu = QMenu("高亮颜色", self)
+            colors = {
+                "黄色": QColor(255, 255, 0, 80),
+                "绿色": QColor(0, 255, 0, 80),
+                "粉色": QColor(255, 192, 203, 80),
+                "蓝色": QColor(135, 206, 250, 80),
+            }
+            for name, qcol in colors.items():
+                act = QAction(name, self)
+                # 使用默认参数捕获颜色
+                act.triggered.connect(lambda _, c=qcol: self._apply_highlight(c))
+                color_menu.addAction(act)
+            menu.addMenu(color_menu)
         menu.exec(event.globalPos())
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -469,6 +510,21 @@ class PageView(QLabel):
         else:
             if self.main_window:
                 self.main_window.status.showMessage("没有可复制的选中文本", 2000)
+
+    def _apply_highlight(self, color: QColor) -> None:
+        """将当前选区添加为高亮并通知主窗口记录。"""
+        if not self._selection_rect or self._selection_rect.isEmpty():
+            return
+        # 将 widget 坐标转换回 PDF 坐标
+        top_left = self._widget_to_page_point(self._selection_rect.topLeft())
+        bottom_right = self._widget_to_page_point(self._selection_rect.bottomRight())
+        rect = fitz.Rect(top_left, bottom_right)
+        # 保存到本页面的高亮列表
+        self.user_highlights.append((rect, color))
+        self.update()
+        # 通知主窗口持久化
+        if self.main_window:
+            self.main_window.record_highlight(self.page_index, rect, color)
 
     def _get_selected_text(self) -> str:
         if not self._selection_rect or self._selection_rect.isEmpty() or not self.main_window or not self.main_window.doc:
@@ -531,6 +587,28 @@ class PageView(QLabel):
         for image in sorted(self.images, key=lambda item: item.bbox.width * item.bbox.height):
             if image.bbox.contains(point):
                 return image
+        return None
+
+    def _find_word_rect(self, point: fitz.Point) -> Optional[fitz.Rect]:
+        """在给定的 PDF 坐标点查找包含该点的单词矩形。
+
+        通过访问主窗口的 ``doc`` 对象获取当前页的文字信息。
+        返回 ``fitz.Rect``，若未找到则返回 ``None``。
+        """
+        if not self.main_window or not self.main_window.doc:
+            return None
+        try:
+            page = self.main_window.doc.load_page(self.page_index)
+            words = page.get_text("words")
+            for w in words:
+                if len(w) < 5:
+                    continue
+                x0, y0, x1, y1, txt = w[0], w[1], w[2], w[3], w[4]
+                word_rect = fitz.Rect(x0, y0, x1, y1)
+                if word_rect.contains(point):
+                    return word_rect
+        except Exception:
+            pass
         return None
 
     def _make_preview_key(self, link: Optional[LinkRegion], image: Optional[ImageRegion]) -> Optional[Tuple[str, int]]:
@@ -712,6 +790,9 @@ class PdfReaderWindow(QMainWindow):
         self.search_hits: List[Tuple[int, fitz.Rect, str]] = []
         self.search_index = -1
         self._pending_restore_scroll: Optional[int] = None
+        # 高亮持久化结构：{page_index: [(rect_dict, rgba_tuple), ...]}
+        # 高亮持久化结构：{page_index: [(rect_dict, rgba_tuple), ...]}
+        self._highlights: dict[int, List[Tuple[dict, Tuple[int, int, int, int]]]] = {}
 
 
         self.scroll_content = QWidget()
@@ -1074,6 +1155,13 @@ class PdfReaderWindow(QMainWindow):
         exit_action.setShortcut(QKeySequence.Quit)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        # 保存高亮修改（快捷键 Ctrl+S）
+        save_action = QAction("保存修改(&S)", self)
+        save_action.setShortcut(QKeySequence.Save)
+        save_action.triggered.connect(self.save_highlights)
+        # 将保存动作放在退出前
+        file_menu.insertAction(exit_action, save_action)
         
         # View 菜单
         view_menu = menubar.addMenu("查看(&V)")
@@ -1345,6 +1433,8 @@ class PdfReaderWindow(QMainWindow):
         self.current_page = max(0, min(int(doc_state.get("last_page", 0)), doc.page_count - 1))
         self.zoom = float(doc_state.get("zoom", self.zoom))
         self._pending_restore_scroll = doc_state.get("scroll")
+        # 加载已保存的高亮信息
+        self._highlights = doc_state.get("highlights", {})
         self.bookmarks = list(doc_state.get("bookmarks", []))
         self.notes = dict(doc_state.get("notes", {}))
         self.history.clear()
@@ -1398,6 +1488,15 @@ class PdfReaderWindow(QMainWindow):
                 page_view = PageView(page_index)
                 page_view.main_window = self
                 page_view.set_page_content(qpix, page.rect, self.zoom, links, images)
+                # 恢复该页的高亮（如果有）
+                if page_index in self._highlights:
+                    for rect_dict, rgba in self._highlights[page_index]:
+                        try:
+                            rect = fitz.Rect(**rect_dict)
+                            color = QColor(*rgba)
+                            page_view.user_highlights.append((rect, color))
+                        except Exception:
+                            continue
                 frame = PageFrame(page_index, total, page_view)
                 self.page_views.append(page_view)
                 self.page_frames.append(frame)
@@ -2432,8 +2531,26 @@ class PdfReaderWindow(QMainWindow):
             "zoom": float(self.zoom),
             "bookmarks": self.bookmarks,
             "notes": self.notes,
+            "highlights": self._highlights,
         }
         self._save_app_state()
+
+    def save_highlights(self) -> None:
+        """手动触发保存当前文档状态（包括高亮）。"""
+        self._save_current_document_state()
+        self.status.showMessage("已保存高亮和其他修改", 2000)
+
+    def record_highlight(self, page_index: int, rect: fitz.Rect, color: QColor) -> None:
+        """记录用户在指定页面的高亮信息，以便保存到状态文件。"""
+        # 将 fitz.Rect 转为可序列化的 dict
+        rect_dict = {
+            "x0": rect.x0,
+            "y0": rect.y0,
+            "x1": rect.x1,
+            "y1": rect.y1,
+        }
+        rgba = (color.red(), color.green(), color.blue(), color.alpha())
+        self._highlights.setdefault(page_index, []).append((rect_dict, rgba))
 
     def _remember_recent_file(self, path: str) -> None:
         path = self._document_key(path)
